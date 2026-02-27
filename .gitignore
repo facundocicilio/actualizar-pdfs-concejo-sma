@@ -1,25 +1,7 @@
-# Entorno virtual
-.venv/
+﻿.venv/
 venv/
-
-# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-
-# Streamlit secrets
-.streamlit/secrets.toml
-
-# Config / env
 .env
-
-# OS / editor
 .DS_Store
-Thumbs.db
-.vscode/
-.idea/
-
-# Data (si querés NO subir PDFs)
 data/
-*.pdf
