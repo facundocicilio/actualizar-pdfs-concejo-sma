@@ -26,4 +26,4 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
         run: |
-          python auto_fetch.py --year "$(date +'%Y')"
+          python auto_fetch.py
