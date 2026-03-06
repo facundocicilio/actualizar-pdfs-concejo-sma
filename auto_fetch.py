@@ -84,15 +84,28 @@ def safe_filename_from_url(url: str) -> str:
 
 
 def fetch_pdf_links(page_url: str) -> list[str]:
-    r = session.get(page_url, timeout=30)
+    print(f"🌐 Leyendo página: {page_url}")
+     r = session.get(page_url, timeout=30)
+    print(f"📡 Status code página: {r.status_code}")
     r.raise_for_status()
+
     soup = BeautifulSoup(r.text, "html.parser")
 
-    links = []
-    for a in soup.find_all("a", href=True):
+     links = []
+    all_links = soup.find_all("a", href=True)
+    print(f"🔎 Cantidad total de enlaces <a>: {len(all_links)}")
+    for a in all_links:
+            texto = a.get_text(" ", strip=True)
         href = a["href"].strip()
+        full = urljoin(page_url, href)
+
+        print("----")
+        print(f"Texto: {texto}")
+        print(f"Href raw: {href}")
+        print(f"Href absoluto: {full}")
+
         if ".pdf" in href.lower():
-            full = urljoin(page_url, href)
+            print("✅ PDF detectado")
             links.append(full)
 
     # dedupe manteniendo orden
@@ -102,6 +115,11 @@ def fetch_pdf_links(page_url: str) -> list[str]:
         if u not in seen:
             seen.add(u)
             out.append(u)
+
+    print(f"📄 PDFs únicos encontrados: {len(out)}")
+    for pdf in out:
+        print(f"   - {pdf}")
+
     return out
 
 
