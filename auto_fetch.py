@@ -1,35 +1,46 @@
 import os
 import re
+import io
 import json
 import time
 import hashlib
 import argparse
+import unicodedata
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
+import fitz  # PyMuPDF
 from bs4 import BeautifulSoup
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.utils import HfHubHTTPError
 
-HF_TOKEN = os.getenv("HF_TOKEN")
-HF_REPO_ID = os.getenv("HF_REPO_ID")
 
-# Permite override manual si querés
+# ============================================================
+# ENV / CONFIG
+# ============================================================
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+HF_REPO_ID = os.getenv("HF_REPO_ID", "").strip()
 SOURCE_URL = os.getenv("SOURCE_URL", "").strip()
 
 INDEX_PATH = "index/index.json"
+DEBUG = os.getenv("DEBUG", "1").strip().lower() in {"1", "true", "yes", "y"}
 
 UA = os.getenv(
     "HTTP_USER_AGENT",
-    "Mozilla/5.0 (compatible; ObservatorioActasBot/1.1; +https://github.com/FacundoCicilio/Actualizar-PDFs-Concejo-SMA)"
+    "Mozilla/5.0 (compatible; ObservatorioActasBot/2.0; +https://github.com/FacundoCicilio/Actualizar-PDFs-Concejo-SMA)"
 )
 
-DEBUG = os.getenv("DEBUG", "1").strip().lower() in {"1", "true", "yes", "y"}
+PROCESSOR_VERSION = 24
 
 session = requests.Session()
 session.headers.update({"User-Agent": UA})
 
 
+# ============================================================
+# LOG
+# ============================================================
 def log(msg: str) -> None:
     print(msg, flush=True)
 
@@ -40,7 +51,7 @@ def dbg(msg: str) -> None:
 
 
 def must_env(name: str) -> str:
-    val = os.getenv(name)
+    val = os.getenv(name, "").strip()
     if not val:
         raise SystemExit(f"Falta variable de entorno {name}. Revisá Secrets y workflow.")
     return val
@@ -50,28 +61,58 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+# ============================================================
+# TEXT HELPERS
+# ============================================================
+def normalize_space(s: str) -> str:
+    s = (s or "").replace("\u00a0", " ")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def _strip_accents(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c) != "Mn")
+
+
+def normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    s = str(s).lower()
+    s = _strip_accents(s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def safe_int(v: Any) -> Optional[int]:
+    try:
+        if v is None:
+            return None
+        return int(str(v).strip())
+    except Exception:
+        return None
+
+
+def canonicalize_url(url: str) -> str:
+    parsed = urlparse((url or "").strip())
+    parsed = parsed._replace(fragment="")
+    return urlunparse(parsed)
+
+
 def sha256_bytes(data: bytes) -> str:
     h = hashlib.sha256()
     h.update(data)
     return h.hexdigest()
 
 
-def canonicalize_url(url: str) -> str:
-    """
-    Normaliza la URL para comparar mejor:
-    - saca fragment (#...)
-    - preserva query
-    - mantiene esquema/host/path
-    """
-    parsed = urlparse(url.strip())
-    parsed = parsed._replace(fragment="")
-    return urlunparse(parsed)
+def make_doc_id(pdf_bytes: bytes, filename: str) -> str:
+    h = hashlib.sha256()
+    h.update(pdf_bytes)
+    h.update((filename or "").encode("utf-8", errors="ignore"))
+    return h.hexdigest()[:16]
 
 
 def safe_filename_from_url(url: str, content_disposition: str | None = None) -> str:
-    """
-    Intenta sacar nombre desde Content-Disposition; si no, desde URL.
-    """
     if content_disposition:
         m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', content_disposition, re.I)
         if m:
@@ -90,82 +131,691 @@ def safe_filename_from_url(url: str, content_disposition: str | None = None) -> 
     return name
 
 
-def load_index() -> dict:
+# ============================================================
+# BOILERPLATE
+# ============================================================
+BOILERPLATE_PATTERNS = [
+    r"Donar\s+Órganos\s+y\s+Sangre\s+es\s+Donar\s+Vida",
+    r"Donar\s+Organos\s+y\s+Sangre\s+es\s+Donar\s+Vida",
+    r"Inf[oó]rmese,?\s*sea\s+donante",
+    r"\bsea\s+donante\b",
+    r"(?:https?:\/\/)?(?:www\.)?incucai\.gov\.ar",
+    r"CONCEJO\s+DELIBERANTE\s+SAN\s+MARTIN\s+DE\s+LOS\s+ANDES",
+    r"CONCEJO\s+DELIBERANTE",
+    r"P[áa]gina\s+\d+\s+de\s+\d+",
+    r"\bP[áa]g\.\s*\d+\b",
+]
+
+
+def remove_boilerplate_lines(text: str) -> str:
+    lines = (text or "").splitlines()
+    cleaned: List[str] = []
+    for ln in lines:
+        ln_strip = ln.strip()
+        if not ln_strip:
+            cleaned.append("")
+            continue
+        if any(re.search(p, ln_strip, re.IGNORECASE) for p in BOILERPLATE_PATTERNS):
+            continue
+        ln_strip = re.sub(r"^[\-\•\●\·\*]+\s*", "", ln_strip).strip()
+        cleaned.append(ln_strip)
+    return "\n".join(cleaned)
+
+
+def remove_boilerplate_global(text: str) -> str:
+    t = text or ""
+    for p in BOILERPLATE_PATTERNS:
+        t = re.sub(p, " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r"\n\s+\n", "\n\n", t)
+    return t.strip()
+
+
+# ============================================================
+# PDF TEXT EXTRACTION
+# ============================================================
+def extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int = 80) -> str:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    out: List[str] = []
+    n_pages = min(len(doc), max_pages)
+
+    for i in range(n_pages):
+        page = doc.load_page(i)
+        words = page.get_text("words") or []
+        if not words:
+            continue
+
+        words.sort(key=lambda w: (round(w[1], 1), round(w[0], 1)))
+
+        line_bins: Dict[int, List[tuple]] = {}
+        for w in words:
+            y = w[1]
+            bin_y = int(round(y / 3.0))
+            line_bins.setdefault(bin_y, []).append(w)
+
+        for bin_y in sorted(line_bins.keys()):
+            line_words = sorted(line_bins[bin_y], key=lambda w: w[0])
+            txt = " ".join([w[4] for w in line_words]).strip()
+            if txt:
+                out.append(txt)
+
+        out.append("")
+
+    doc.close()
+    return "\n".join(out)
+
+
+def extract_cover_lines(pdf_bytes: bytes) -> List[str]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if len(doc) == 0:
+        return []
+    page = doc.load_page(0)
+    words = page.get_text("words") or []
+    doc.close()
+
+    if not words:
+        return []
+
+    words.sort(key=lambda w: (round(w[1], 1), round(w[0], 1)))
+
+    line_bins: Dict[int, List[tuple]] = {}
+    for w in words:
+        y = w[1]
+        bin_y = int(round(y / 3.0))
+        line_bins.setdefault(bin_y, []).append(w)
+
+    lines: List[str] = []
+    for bin_y in sorted(line_bins.keys()):
+        line_words = sorted(line_bins[bin_y], key=lambda w: w[0])
+        txt = " ".join([w[4] for w in line_words]).strip()
+        if txt:
+            lines.append(txt)
+
+    return lines
+
+
+# ============================================================
+# DATES / METADATA
+# ============================================================
+MONTHS = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
+    "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
+    "noviembre": 11, "diciembre": 12,
+}
+
+
+def parse_spanish_date_any(s: str) -> Optional[datetime]:
+    s = (s or "").strip()
+    m = re.search(r"\b(\d{1,2})\s+de\s+([A-Za-zÁÉÍÓÚáéíóúñÑ]+)\s+de\s+(20\d{2})\b", s, re.IGNORECASE)
+    if not m:
+        return None
+    d = int(m.group(1))
+    mn = m.group(2).lower()
+    y = int(m.group(3))
+    mo = MONTHS.get(mn)
+    if not mo:
+        return None
     try:
-        file_path = hf_hub_download(
-            repo_id=HF_REPO_ID,
-            filename=INDEX_PATH,
-            repo_type="dataset",
-            token=HF_TOKEN,
-        )
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if not isinstance(data, dict):
-                raise ValueError("index.json no es un dict")
-            data.setdefault("source", {})
-            data.setdefault("files", {})
-            data.setdefault("last_run", None)
-            return data
-    except Exception as e:
-        dbg(f"⚠️ No pude cargar index previo: {e}")
-        return {"source": {}, "files": {}, "last_run": None}
+        return datetime(y, mo, d)
+    except Exception:
+        return None
 
 
-def save_index(index: dict) -> None:
-    tmp_file = "tmp_index.json"
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(index, f, indent=2, ensure_ascii=False)
+def parse_date_any(s: Optional[str]) -> datetime:
+    if not s:
+        return datetime.min
+    s = str(s).strip()
 
-    log(f"📝 Guardando index con {len(index.get('files', {}))} archivos.")
-    api = HfApi()
-    api.upload_file(
-        path_or_fileobj=tmp_file,
-        path_in_repo=INDEX_PATH,
-        repo_id=HF_REPO_ID,
-        repo_type="dataset",
-        token=HF_TOKEN,
+    m = re.match(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})", s)
+    if m:
+        d, mo, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if y < 100:
+            y += 2000
+        try:
+            return datetime(y, mo, d)
+        except Exception:
+            return datetime.min
+
+    dt = parse_spanish_date_any(s)
+    if dt:
+        return dt
+
+    return datetime.min
+
+
+def infer_num_year_from_filename(filename: str) -> Tuple[Optional[int], Optional[int]]:
+    if not filename:
+        return (None, None)
+    f = filename.lower()
+
+    m = re.search(r"\bno[-_\s]*0*(\d{1,3})[-_](\d{2})\b", f)
+    if m:
+        num = int(m.group(1))
+        yy = int(m.group(2))
+        return (num, 2000 + yy)
+
+    m = re.search(r"\bno[-_\s]*0*(\d{1,3})[-_](20\d{2})\b", f)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+
+    m = re.search(r"\b[-_](\d{1,3})[-_](20\d{2})\b", f)
+    if m:
+        return (int(m.group(1)), int(m.group(2)))
+
+    m = re.search(r"\b(\d{1,3})[-_](\d{2})\b", f)
+    if m:
+        return (int(m.group(1)), 2000 + int(m.group(2)))
+
+    return (None, None)
+
+
+def normalize_session_number(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    m = re.search(r"\b(\d{1,3})\b", str(s))
+    return int(m.group(1)) if m else None
+
+
+def extract_box_header_info(pdf_bytes: bytes) -> Dict[str, Any]:
+    lines = extract_cover_lines(pdf_bytes)
+    if not lines:
+        return {}
+    page_text = "\n".join(lines)
+
+    stype = None
+    if re.search(r"\bORDEN\s+DEL\s+D[IÍ]A\b", page_text, re.IGNORECASE):
+        stype = "ORDEN DEL DIA"
+    elif re.search(r"\bACTA\b", page_text, re.IGNORECASE):
+        stype = "ACTA"
+
+    mnum = re.search(
+        r"\bSESIO[NÓO]\s+(?:ORDINARIA|EXTRAORDINARIA|ESPECIAL)\s+N(?:ro|°|º|o)?[:\.]?\s*0*(\d{1,3})\b",
+        page_text,
+        re.IGNORECASE,
     )
-    log("✅ Index subido correctamente.")
+    sn = str(int(mnum.group(1))) if mnum else None
+
+    my = re.search(r"\bA[ñn]o\s+(20\d{2})\b", page_text, re.IGNORECASE)
+    sy = int(my.group(1)) if my else None
+
+    dt = parse_spanish_date_any(page_text)
+    date_str = None
+    if dt:
+        date_str = dt.strftime("%d/%m/%Y")
+        if sy is None:
+            sy = dt.year
+
+    out: Dict[str, Any] = {}
+    if stype:
+        out["session_type"] = stype
+    if sn:
+        out["session_number"] = sn
+    if sy:
+        out["session_year"] = sy
+    if date_str:
+        out["date"] = date_str
+    return out
 
 
+def parse_metadata(text: str, filename: str, box: Dict[str, Any]) -> Dict[str, Any]:
+    t = text or ""
+    head = "\n".join(t.splitlines()[:200])
+
+    session_type = box.get("session_type")
+    session_number = box.get("session_number")
+    session_year = box.get("session_year")
+    date_str = box.get("date")
+
+    f_num, f_year = infer_num_year_from_filename(filename or "")
+    if session_number is None and f_num is not None:
+        session_number = str(f_num)
+    if session_year is None and f_year is not None:
+        session_year = f_year
+
+    if session_type is None:
+        if re.search(r"orden\s+del\s+d[ií]a", head, re.IGNORECASE):
+            session_type = "ORDEN DEL DIA"
+        elif re.search(r"\bacta\b", head, re.IGNORECASE):
+            session_type = "ACTA"
+
+    if date_str is None:
+        m = re.search(
+            r"San\s+Mart[ií]n\s+de\s+los\s+Andes\s*,?\s*(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})",
+            head,
+            re.IGNORECASE,
+        )
+        if m:
+            date_str = m.group(1)
+
+    if date_str is None:
+        m = re.search(
+            r"(\d{1,2}\s+de\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+\s+de\s+20\d{2})",
+            head,
+            re.IGNORECASE,
+        )
+        if m:
+            dt = parse_date_any(m.group(1))
+            if dt != datetime.min:
+                date_str = dt.strftime("%d/%m/%Y")
+
+    if session_year is None:
+        dt = parse_date_any(date_str)
+        if dt != datetime.min:
+            session_year = dt.year
+
+    sn_int = normalize_session_number(session_number)
+    session_number = str(sn_int) if sn_int is not None else None
+
+    return {
+        "session_type": session_type,
+        "session_number": session_number,
+        "session_year": session_year,
+        "date": date_str,
+    }
+
+
+# ============================================================
+# TOPICS / IMPACT / ITEMS
+# ============================================================
+TOPIC_RULES = [
+    ("Agua/Servicios", ["agua", "cloaca", "gas", "energía", "energia", "luz", "residuos", "basura", "saneamiento"]),
+    ("Tarifas", ["tarifa", "tasas", "impuesto", "tribut", "arancel", "reajuste", "actualización", "actualizacion"]),
+    ("Obra pública", ["obra", "pavimento", "asfalto", "vereda", "plaza", "puente", "licitación", "licitacion", "contratación", "contratacion"]),
+    ("Seguridad", ["seguridad", "tránsito", "transito", "control", "inspección", "inspeccion", "alcoholemia", "emergencia"]),
+    ("Comercio", ["comercio", "habilitación", "habilitacion", "local", "feria", "gastronomía", "gastronomia", "turismo"]),
+    ("Ambiente", ["ambiente", "bosque", "incendio", "impacto", "contaminación", "contaminacion", "reserva"]),
+    ("Vivienda/Urbanismo", ["vivienda", "urban", "lote", "zonificación", "zonificacion", "catastro", "edificación", "edificacion", "loteo"]),
+    ("Educación/Cultura", ["educación", "educacion", "escuela", "cultura", "biblioteca", "museo", "deporte"]),
+]
+
+
+def classify_topics(text: str) -> List[str]:
+    t = (text or "").lower()
+    topics: List[str] = []
+    for label, keys in TOPIC_RULES:
+        if any(k in t for k in keys):
+            topics.append(label)
+    return topics
+
+
+IMPACT_RULES = [
+    ("💰 Bolsillo", ["tarifa", "tasa", "impuesto", "tribut", "arancel", "reajuste", "actualización", "actualizacion", "módulo", "modulo", "valor"]),
+    ("🏗 Infraestructura", ["obra", "licitación", "licitacion", "contratación", "contratacion", "pavimento", "asfalto", "vereda", "plaza", "puente"]),
+    ("🚦 Tránsito/Seguridad", ["tránsito", "transito", "circulación", "circulacion", "corte", "estacionamiento", "control", "inspección", "inspeccion", "alcoholemia", "seguridad"]),
+    ("🚰 Servicios", ["agua", "cloaca", "gas", "energía", "energia", "luz", "residuos", "basura", "saneamiento"]),
+    ("🏪 Comercio", ["habilitación", "habilitacion", "comercio", "local", "feria", "gastronomía", "gastronomia", "turismo"]),
+    ("🏘 Urbanismo", ["lote", "loteo", "urban", "zonificación", "zonificacion", "catastro", "edificación", "edificacion", "vivienda"]),
+    ("🌿 Ambiente", ["ambiente", "bosque", "incendio", "impacto", "contaminación", "contaminacion", "reserva"]),
+]
+
+
+def infer_impact(text: str) -> Dict[str, Any]:
+    t = (text or "").lower()
+    hits: List[str] = []
+    for label, keys in IMPACT_RULES:
+        if any(k in t for k in keys):
+            hits.append(label)
+
+    if not hits:
+        return {"impact_tags": [], "impact_text": "🧩 Informativo: no se ve un impacto directo claro (puede ser interno/administrativo)."}
+
+    msg_map = {
+        "💰 Bolsillo": "Puede impactar en montos a pagar (tasas/tarifas/condiciones).",
+        "🏗 Infraestructura": "Puede implicar obras, mejoras o cortes asociados.",
+        "🚦 Tránsito/Seguridad": "Puede cambiar circulación, controles o normas.",
+        "🚰 Servicios": "Puede afectar servicios básicos (agua/cloaca/energía/residuos).",
+        "🏪 Comercio": "Puede afectar habilitaciones, comercios o turismo.",
+        "🏘 Urbanismo": "Puede afectar loteos, zonificación o desarrollo urbano.",
+        "🌿 Ambiente": "Puede afectar regulaciones ambientales o áreas naturales.",
+    }
+    top = hits[:2]
+    text_out = " ".join([f"{h}: {msg_map.get(h, '')}".strip() for h in top]).strip()
+    return {"impact_tags": hits[:4], "impact_text": text_out}
+
+
+def build_que_dice(raw: str) -> str:
+    s = normalize_space(raw)
+    if not s:
+        return ""
+    action = "Tema"
+    t = s.lower()
+    if "dictamen" in t:
+        action = "Dictamen"
+    elif "decreto" in t:
+        action = "Decreto"
+    elif "nota" in t:
+        action = "Nota"
+    elif "habilitación" in t or "habilitacion" in t:
+        action = "Habilitación"
+    elif "obra" in t or "licitación" in t or "licitacion" in t:
+        action = "Obra pública"
+
+    main = s
+    if len(main) > 260:
+        main = main[:260].rsplit(" ", 1)[0] + "…"
+
+    return f"{action}: {main}".strip()
+
+
+def extract_items(text: str) -> List[Dict[str, Any]]:
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    items: List[Dict[str, Any]] = []
+
+    exp_tema_pat = re.compile(r"^(\d{1,6}(?:[-]\d{1,6})?/\d{4})\s*[—–-]\s*Tema:\s*(.*)$", re.IGNORECASE)
+    exp_pat = re.compile(r"^(\d{1,6}(?:[-]\d{1,6})?/\d{4})\s*[—–-]\s*(.*)$", re.IGNORECASE)
+    num_pat = re.compile(r"^(\d{1,2})[\.\)]\s+(.*)$")
+
+    def is_new_item(line: str) -> Optional[Tuple[str, re.Match]]:
+        for typ, p in [("exp_tema", exp_tema_pat), ("exp", exp_pat), ("num", num_pat)]:
+            m = p.match(line)
+            if m:
+                return (typ, m)
+        return None
+
+    i = 0
+    while i < len(lines):
+        hit = is_new_item(lines[i])
+        if not hit:
+            i += 1
+            continue
+
+        typ, m = hit
+        key = (m.group(1) or "").strip()
+        first = (m.group(2) or "").strip()
+
+        parts = [first] if first else []
+        j = i + 1
+        while j < len(lines):
+            if is_new_item(lines[j]):
+                break
+            parts.append(lines[j])
+            j += 1
+
+        full = normalize_space(" ".join(parts))
+        full = remove_boilerplate_global(full)
+        if not full:
+            i = j
+            continue
+
+        dec_inside = None
+        mdec = re.search(r"(?:Decreto)\s*(?:N[°º]\s*)?([A-Z0-9\-\./]+)", full, re.IGNORECASE)
+        if mdec:
+            dec_inside = mdec.group(1)
+
+        exp_inside = None
+        mexp = re.search(r"(?:Expediente)\s*(?:N[°º]\s*)?([A-Z0-9\-\./]+)", full, re.IGNORECASE)
+        if mexp:
+            exp_inside = mexp.group(1)
+
+        qd = build_que_dice(full)
+        impact = infer_impact(full)
+
+        items.append(
+            {
+                "key": key if key else None,
+                "title": full[:2000],
+                "que_dice": qd,
+                "impact_text": impact["impact_text"],
+                "impact_tags": impact["impact_tags"],
+                "decreto": dec_inside,
+                "expediente": exp_inside or (key if typ in ("exp", "exp_tema") else None),
+                "topics": classify_topics(full),
+            }
+        )
+
+        i = j
+
+    for idx, it in enumerate(items, start=1):
+        if not it.get("key"):
+            it["key"] = str(idx)
+
+    return items[:800]
+
+
+def build_summary_citizen(meta: Dict[str, Any], topics: List[str], items: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+
+    head = []
+    if meta.get("date"):
+        head.append(f"**Fecha:** {meta['date']}")
+    if meta.get("session_type") or meta.get("session_number") or meta.get("session_year"):
+        head.append(
+            f"**Documento:** {(meta.get('session_type') or 'ORDEN DEL DIA')} N° {(meta.get('session_number') or 's/n')} (Año {(meta.get('session_year') or 's/año')})"
+        )
+    if head:
+        parts.append(" · ".join(head))
+
+    if topics:
+        parts.append(f"**Temas:** {', '.join(topics)}")
+
+    parts.append("")
+
+    if items:
+        parts.append(f"**Ítems detectados:** {len(items)}")
+        parts.append("")
+        parts.append("**Puntos (claro y directo):**")
+        for it in items[:10]:
+            qd = (it.get("que_dice") or "").strip()
+            imp = (it.get("impact_text") or "").strip()
+            if qd:
+                parts.append(f"- **{it.get('key')}**: {qd}")
+                if imp:
+                    parts.append(f"  - _Impacto_: {imp}")
+    else:
+        parts.append("No se detectaron ítems claros (PDF escaneado o texto muy roto).")
+
+    return "\n".join(parts)
+
+
+def process_pdf(pdf_bytes: bytes, filename: str) -> Dict[str, Any]:
+    box = extract_box_header_info(pdf_bytes)
+
+    raw_text = extract_text_from_pdf_bytes(pdf_bytes)
+    raw_text = remove_boilerplate_lines(raw_text)
+    raw_text = remove_boilerplate_global(raw_text)
+    text = normalize_space(raw_text)
+
+    meta = parse_metadata(text, filename=filename, box=box)
+    topics = classify_topics(text)
+    items = extract_items(text)
+
+    return {
+        "processor_version": PROCESSOR_VERSION,
+        "source": {"filename": filename, "processed_at": datetime.utcnow().isoformat() + "Z"},
+        "box_meta": box,
+        **meta,
+        "topics": topics,
+        "items": items,
+        "entities": {"persons": [], "orgs": []},
+        "summary_citizen": build_summary_citizen(meta, topics, items),
+        "text_preview": text[:12000],
+    }
+
+
+# ============================================================
+# HF DATASET HELPERS
+# ============================================================
+def api() -> HfApi:
+    if not HF_TOKEN:
+        raise RuntimeError("Falta HF_TOKEN.")
+    return HfApi(token=HF_TOKEN)
+
+
+def download_text_file(repo_id: str, path: str) -> Optional[str]:
+    try:
+        local = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename=path, token=HF_TOKEN)
+        with open(local, "r", encoding="utf-8") as f:
+            return f.read()
+    except HfHubHTTPError:
+        return None
+    except Exception:
+        return None
+
+
+def load_processed_json(repo_id: str, doc_id: str) -> Optional[Dict[str, Any]]:
+    raw = download_text_file(repo_id, f"processed/{doc_id}.json")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def rebuild_index_from_processed(repo_id: str) -> List[Dict[str, Any]]:
+    log("🛠 Reconstruyendo index desde processed/*.json ...")
+    out: List[Dict[str, Any]] = []
+    files = api().list_repo_files(repo_id=repo_id, repo_type="dataset")
+
+    processed_files = [p for p in files if p.startswith("processed/") and p.endswith(".json")]
+    dbg(f"Processed encontrados: {len(processed_files)}")
+
+    for p in processed_files:
+        m = re.match(r"processed/([a-f0-9]{16})\.json$", p)
+        if not m:
+            continue
+        doc_id = m.group(1)
+        payload = load_processed_json(repo_id, doc_id) or {}
+
+        original_filename = (
+            payload.get("source", {}).get("filename")
+            or f"{doc_id}.pdf"
+        )
+
+        record = {
+            "doc_id": doc_id,
+            "original_filename": original_filename,
+            "pdf_path": f"raw/{doc_id}.pdf",
+            "json_path": p,
+            "created_at": payload.get("source", {}).get("processed_at") or utc_now_iso(),
+            "session_type": payload.get("session_type"),
+            "session_number": payload.get("session_number"),
+            "session_year": payload.get("session_year"),
+            "date": payload.get("date"),
+            "topics": payload.get("topics", []),
+            "source_url": payload.get("source_url"),
+            "sha256": payload.get("sha256"),
+        }
+        out.append(record)
+
+    out.sort(
+        key=lambda r: (
+            safe_int(r.get("session_year")) or 0,
+            normalize_session_number(r.get("session_number")) or 0,
+            r.get("created_at") or "",
+        ),
+        reverse=True,
+    )
+    log(f"✅ Index reconstruido con {len(out)} documentos.")
+    return out
+
+
+def load_index(repo_id: str) -> List[Dict[str, Any]]:
+    raw = download_text_file(repo_id, INDEX_PATH)
+    if not raw:
+        return []
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return rebuild_index_from_processed(repo_id)
+
+    if isinstance(data, list):
+        return data
+
+    # si quedó el formato viejo dict/files, reconstruimos desde processed
+    if isinstance(data, dict):
+        return rebuild_index_from_processed(repo_id)
+
+    return []
+
+
+def save_index(repo_id: str, index: List[Dict[str, Any]], message: str = "Update index") -> None:
+    content = json.dumps(index, ensure_ascii=False, indent=2).encode("utf-8")
+    api().upload_file(
+        path_or_fileobj=io.BytesIO(content),
+        path_in_repo=INDEX_PATH,
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=message,
+    )
+
+
+def upload_pdf_and_json(
+    repo_id: str,
+    doc_id: str,
+    pdf_bytes: bytes,
+    processed_json: Dict[str, Any],
+    original_filename: str,
+    source_url: str,
+    sha256_digest: str,
+) -> Dict[str, str]:
+    hf = api()
+
+    pdf_path = f"raw/{doc_id}.pdf"
+    json_path = f"processed/{doc_id}.json"
+
+    # 1) subir PDF
+    hf.upload_file(
+        path_or_fileobj=io.BytesIO(pdf_bytes),
+        path_in_repo=pdf_path,
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=f"Add PDF {doc_id}",
+    )
+
+    # 2) enriquecer JSON
+    processed_json = dict(processed_json or {})
+    processed_json["source_url"] = source_url
+    processed_json["sha256"] = sha256_digest
+
+    # 3) subir JSON
+    json_bytes = json.dumps(processed_json, ensure_ascii=False, indent=2).encode("utf-8")
+    hf.upload_file(
+        path_or_fileobj=io.BytesIO(json_bytes),
+        path_in_repo=json_path,
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=f"Add processed {doc_id}",
+    )
+
+    # 4) actualizar índice correcto
+    index = load_index(repo_id)
+
+    record = {
+        "doc_id": doc_id,
+        "original_filename": original_filename,
+        "pdf_path": pdf_path,
+        "json_path": json_path,
+        "created_at": datetime.utcnow().isoformat() + "Z",
+        "session_type": processed_json.get("session_type"),
+        "session_number": processed_json.get("session_number"),
+        "session_year": processed_json.get("session_year"),
+        "date": processed_json.get("date"),
+        "topics": processed_json.get("topics", []),
+        "source_url": source_url,
+        "sha256": sha256_digest,
+    }
+
+    index = [r for r in index if r.get("doc_id") != doc_id]
+    index.insert(0, record)
+    save_index(repo_id, index, message=f"Index {doc_id}")
+
+    return {"pdf_path": pdf_path, "json_path": json_path}
+
+
+# ============================================================
+# DISCOVERY
+# ============================================================
 def is_probable_document_link(text: str, href: str) -> bool:
-    """
-    Detecta links probables a documentos.
-    No depende solo del texto visible, porque puede venir mal escrito.
-    """
     href_l = (href or "").lower()
     text_l = (text or "").lower()
 
-    # Caso ideal: el href ya apunta a pdf
     if ".pdf" in href_l:
         return True
 
-    # Pistas comunes de documentos/descargas
-    href_keywords = [
-        "upload",
-        "uploads",
-        "download",
-        "descarga",
-        "archivo",
-        "file",
-        "media",
-        "wp-content",
-        "document",
-        "docs",
-    ]
-    text_keywords = [
-        "orden",
-        "día",
-        "dia",
-        "sesión",
-        "sesion",
-        "acta",
-        "extraordinaria",
-        "ordinaria",
-        "documento",
-        "descargar",
-        "pdf",
-    ]
+    href_keywords = ["upload", "uploads", "download", "descarga", "archivo", "file", "media", "wp-content", "document", "docs"]
+    text_keywords = ["orden", "día", "dia", "sesión", "sesion", "acta", "extraordinaria", "ordinaria", "documento", "descargar", "pdf"]
 
     if any(k in href_l for k in href_keywords) and any(k in text_l for k in text_keywords):
         return True
@@ -173,7 +823,7 @@ def is_probable_document_link(text: str, href: str) -> bool:
     return False
 
 
-def fetch_pdf_links(page_url: str) -> list[str]:
+def fetch_pdf_links(page_url: str) -> List[str]:
     log(f"🌐 Leyendo página: {page_url}")
     r = session.get(page_url, timeout=30)
     log(f"📡 Status code página: {r.status_code}")
@@ -183,7 +833,7 @@ def fetch_pdf_links(page_url: str) -> list[str]:
     all_links = soup.find_all("a", href=True)
     log(f"🔎 Cantidad total de enlaces <a>: {len(all_links)}")
 
-    candidates = []
+    candidates: List[str] = []
 
     for i, a in enumerate(all_links, start=1):
         raw_href = (a.get("href") or "").strip()
@@ -197,7 +847,6 @@ def fetch_pdf_links(page_url: str) -> list[str]:
 
         if not raw_href:
             continue
-
         if raw_href.lower().startswith(("javascript:", "mailto:", "tel:")):
             continue
 
@@ -205,7 +854,6 @@ def fetch_pdf_links(page_url: str) -> list[str]:
             dbg(f"[{i}] ✅ Candidato a documento")
             candidates.append(full)
 
-    # dedupe manteniendo orden
     seen = set()
     out = []
     for u in candidates:
@@ -220,13 +868,7 @@ def fetch_pdf_links(page_url: str) -> list[str]:
     return out
 
 
-def download_pdf(url: str) -> tuple[bytes, str, str | None]:
-    """
-    Descarga el archivo. Devuelve:
-    - bytes
-    - final_url (tras redirecciones)
-    - content-disposition
-    """
+def download_pdf(url: str) -> Tuple[bytes, str, Optional[str]]:
     r = session.get(url, timeout=60, allow_redirects=True)
     r.raise_for_status()
 
@@ -238,7 +880,6 @@ def download_pdf(url: str) -> tuple[bytes, str, str | None]:
     dbg(f"📨 Content-Type: {content_type}")
     dbg(f"📨 Content-Disposition: {content_disposition}")
 
-    # Chequeo flexible
     looks_like_pdf = (
         ".pdf" in final_url.lower()
         or "application/pdf" in content_type
@@ -253,35 +894,9 @@ def download_pdf(url: str) -> tuple[bytes, str, str | None]:
     return r.content, final_url, content_disposition
 
 
-def upload_pdf_to_hf(pdf_bytes: bytes, path_in_repo: str) -> None:
-    api = HfApi()
-    api.upload_file(
-        path_or_fileobj=pdf_bytes,
-        path_in_repo=path_in_repo,
-        repo_id=HF_REPO_ID,
-        repo_type="dataset",
-        token=HF_TOKEN,
-    )
-
-
-def ensure_files_dict(index: dict) -> dict:
-    files = index.get("files")
-    if isinstance(files, dict):
-        return files
-    return {}
-
-
-def normalize_known_urls(known: dict) -> dict:
-    """
-    Crea un mapa por URL canonizada.
-    """
-    out = {}
-    for key, meta in known.items():
-        ck = canonicalize_url(key)
-        out[ck] = meta
-    return out
-
-
+# ============================================================
+# MAIN
+# ============================================================
 def main():
     must_env("HF_TOKEN")
     must_env("HF_REPO_ID")
@@ -289,7 +904,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--year", type=int, default=None, help="Año a revisar (ej: 2026)")
     parser.add_argument("--source-url", type=str, default=None, help="URL manual para revisar")
-    parser.add_argument("--sleep", type=float, default=0.0, help="Pausa entre descargas (segundos)")
+    parser.add_argument("--sleep", type=float, default=0.0, help="Pausa entre descargas")
     args = parser.parse_args()
 
     year = args.year or datetime.now().year
@@ -301,36 +916,33 @@ def main():
     log(f"🗓️ Año: {year}")
     log(f"🐞 DEBUG: {DEBUG}")
 
-    index = load_index()
-    index["last_run"] = utc_now_iso()
-    index["source"] = {"page_url": page_url, "year": year}
+    index = load_index(HF_REPO_ID)
 
-    known_raw = ensure_files_dict(index)
-    known = normalize_known_urls(known_raw)
+    known_source_urls = {
+        canonicalize_url((r.get("source_url") or "").strip())
+        for r in index
+        if (r.get("source_url") or "").strip()
+    }
+    known_doc_ids = {r.get("doc_id") for r in index if r.get("doc_id")}
 
-    log("📚 URLs ya conocidas en index:")
-    if known:
-        for k in known.keys():
-            log(f"   - {k}")
-    else:
-        log("   (ninguna)")
+    log(f"📚 Documentos ya indexados: {len(index)}")
+    for r in index[:20]:
+        dbg(f"   - {r.get('doc_id')} | {r.get('original_filename')} | {r.get('source_url')}")
 
     pdf_links = fetch_pdf_links(page_url)
+    new_links = [u for u in pdf_links if canonicalize_url(u) not in known_source_urls]
 
-    # Comparación por URL canonizada
-    new_links = [u for u in pdf_links if canonicalize_url(u) not in known]
-
-    log(f"🆕 Nuevos detectados: {len(new_links)}")
+    log(f"🆕 Nuevos detectados por URL: {len(new_links)}")
     for u in new_links:
         log(f"   - {u}")
 
     if not new_links:
-        save_index(index)
-        log("✅ No hay PDFs nuevos. Index actualizado.")
+        log("✅ No hay PDFs nuevos por URL.")
         return
 
     uploaded_count = 0
-    errors = []
+    skipped_count = 0
+    errors: List[str] = []
 
     for url in new_links:
         try:
@@ -338,34 +950,64 @@ def main():
             data, final_url, content_disposition = download_pdf(url)
             digest = sha256_bytes(data)
             fname = safe_filename_from_url(final_url, content_disposition)
-            path_in_repo = f"pdfs/ordenes_del_dia/{year}/{fname}"
+            doc_id = make_doc_id(data, fname)
 
             log(f"✅ Descargado OK. Bytes: {len(data)}")
             log(f"🔐 SHA256: {digest}")
             log(f"📁 Nombre inferido: {fname}")
-            log(f"📦 Path en repo: {path_in_repo}")
+            log(f"🆔 doc_id: {doc_id}")
 
-            # Si la final_url ya existe en index, evita duplicado accidental por redirect distinto
-            if final_url in known:
-                log(f"⚠️ Saltado: la URL final ya existe en index: {final_url}")
+            # Si por algún motivo ya existe ese doc_id, lo salteamos
+            if doc_id in known_doc_ids:
+                log(f"⚠️ Saltado: doc_id ya existente {doc_id}")
+                skipped_count += 1
                 continue
 
-            upload_pdf_to_hf(data, path_in_repo)
-            log("✅ PDF subido a Hugging Face.")
+            with_index_same_url = any(
+                canonicalize_url((r.get("source_url") or "").strip()) == final_url
+                for r in index
+            )
+            if with_index_same_url:
+                log(f"⚠️ Saltado: source_url ya existente {final_url}")
+                skipped_count += 1
+                continue
 
-            meta = {
-                "url": final_url,
-                "discovered_url": canonicalize_url(url),
-                "sha256": digest,
-                "path_in_repo": path_in_repo,
-                "uploaded_at": utc_now_iso(),
-                "filename": fname,
-                "year": year,
-            }
+            log("🧠 Procesando PDF...")
+            processed = process_pdf(data, fname)
 
-            # guardamos con URL final, no con URL cruda
-            known[final_url] = meta
+            log("📦 Subiendo raw + processed + index...")
+            upload_pdf_and_json(
+                repo_id=HF_REPO_ID,
+                doc_id=doc_id,
+                pdf_bytes=data,
+                processed_json=processed,
+                original_filename=fname,
+                source_url=final_url,
+                sha256_digest=digest,
+            )
+
+            index.insert(
+                0,
+                {
+                    "doc_id": doc_id,
+                    "original_filename": fname,
+                    "pdf_path": f"raw/{doc_id}.pdf",
+                    "json_path": f"processed/{doc_id}.json",
+                    "created_at": datetime.utcnow().isoformat() + "Z",
+                    "session_type": processed.get("session_type"),
+                    "session_number": processed.get("session_number"),
+                    "session_year": processed.get("session_year"),
+                    "date": processed.get("date"),
+                    "topics": processed.get("topics", []),
+                    "source_url": final_url,
+                    "sha256": digest,
+                },
+            )
+            known_doc_ids.add(doc_id)
+            known_source_urls.add(final_url)
+
             uploaded_count += 1
+            log("✅ Documento subido y indexado correctamente.")
 
             if args.sleep > 0:
                 time.sleep(args.sleep)
@@ -375,15 +1017,10 @@ def main():
             log(err)
             errors.append(err)
 
-    index["files"] = known
-    if errors:
-        index["last_errors"] = errors[-20:]
-
-    save_index(index)
-    log(f"🏁 Listo. Subidos {uploaded_count} PDFs nuevos. Index actualizado.")
+    log(f"🏁 Fin. Nuevos subidos: {uploaded_count} | Saltados: {skipped_count} | Errores: {len(errors)}")
 
     if errors:
-        log("⚠️ Hubo errores en algunos archivos:")
+        log("⚠️ Errores:")
         for e in errors:
             log(f"   - {e}")
 
