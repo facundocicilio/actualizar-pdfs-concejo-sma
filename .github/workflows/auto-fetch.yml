@@ -19,7 +19,7 @@ jobs:
       - name: Install deps
         run: |
           pip install -r requirements.txt || true
-          pip install requests beautifulsoup4 python-dateutil tqdm huggingface_hub
+          pip install requests beautifulsoup4 python-dateutil tqdm huggingface_hub PyMuPDF
 
       - name: Run auto_fetch
         env:
