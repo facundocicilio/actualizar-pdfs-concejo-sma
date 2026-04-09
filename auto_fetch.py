@@ -32,7 +32,7 @@ UA = os.getenv(
     "Mozilla/5.0 (compatible; ObservatorioActasBot/2.0; +https://github.com/FacundoCicilio/Actualizar-PDFs-Concejo-SMA)"
 )
 
-PROCESSOR_VERSION = 24
+PROCESSOR_VERSION = 25
 
 session = requests.Session()
 session.headers.update({"User-Agent": UA})
@@ -497,6 +497,19 @@ def build_que_dice(raw: str) -> str:
     return f"{action}: {main}".strip()
 
 
+# Patrón para formato SMA:
+# "1. 05001-82/2024   02/03/2026   Miembro Informante: Concejal Vita"
+# siguiente línea: "181/2026 --- Tema: Dictamen s/ ..."
+MI_PAT = re.compile(
+    r"^(\d{1,2})\.\s+((?:\d{5,6}[-/]\d{1,6}/\d{4}|EE-\d{4}-\d+\S*))\s+\d{2}/\d{2}/\d{4}\s+Miembro\s+Informante:",
+    re.IGNORECASE
+)
+TEMA_LINE_PAT = re.compile(
+    r"^\d+/\d{4}\s*---\s*Tema:\s*(.+)$",
+    re.IGNORECASE
+)
+
+
 def extract_items(text: str) -> List[Dict[str, Any]]:
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     items: List[Dict[str, Any]] = []
@@ -506,6 +519,10 @@ def extract_items(text: str) -> List[Dict[str, Any]]:
     num_pat = re.compile(r"^(\d{1,2})[\.\)]\s+(.*)$")
 
     def is_new_item(line: str) -> Optional[Tuple[str, re.Match]]:
+        # Primero chequeamos si es el patrón SMA con Miembro Informante
+        # para no confundirlo con num_pat
+        if MI_PAT.match(line):
+            return None  # lo maneja el bloque MI_PAT abajo
         for typ, p in [("exp_tema", exp_tema_pat), ("exp", exp_pat), ("num", num_pat)]:
             m = p.match(line)
             if m:
@@ -514,6 +531,52 @@ def extract_items(text: str) -> List[Dict[str, Any]]:
 
     i = 0
     while i < len(lines):
+
+        # ── Patrón SMA: "N. expediente fecha Miembro Informante: Concejal X" ──
+        mi_match = MI_PAT.match(lines[i])
+        if mi_match:
+            exp_ref = mi_match.group(2).strip()
+            tema_text = ""
+            j = i + 1
+            # buscar línea con "decreto/año --- Tema: ..."
+            while j < len(lines) and j < i + 5:
+                tm = TEMA_LINE_PAT.match(lines[j])
+                if tm:
+                    tema_text = tm.group(1).strip()
+                    j += 1
+                    # capturar continuación del tema
+                    while j < len(lines):
+                        if MI_PAT.match(lines[j]):
+                            break
+                        if TEMA_LINE_PAT.match(lines[j]):
+                            break
+                        if is_new_item(lines[j]):
+                            break
+                        tema_text += " " + lines[j]
+                        j += 1
+                    break
+                j += 1
+
+            if tema_text:
+                full = normalize_space(tema_text)
+                full = remove_boilerplate_global(full)
+                if full:
+                    qd = build_que_dice(full)
+                    impact = infer_impact(full)
+                    items.append({
+                        "key": exp_ref,
+                        "title": full[:2000],
+                        "que_dice": qd,
+                        "impact_text": impact["impact_text"],
+                        "impact_tags": impact["impact_tags"],
+                        "decreto": None,
+                        "expediente": exp_ref,
+                        "topics": classify_topics(full),
+                    })
+            i = j
+            continue
+
+        # ── Patrones clásicos ──
         hit = is_new_item(lines[i])
         if not hit:
             i += 1
@@ -526,6 +589,8 @@ def extract_items(text: str) -> List[Dict[str, Any]]:
         parts = [first] if first else []
         j = i + 1
         while j < len(lines):
+            if MI_PAT.match(lines[j]):
+                break
             if is_new_item(lines[j]):
                 break
             parts.append(lines[j])
@@ -723,7 +788,6 @@ def load_index(repo_id: str) -> List[Dict[str, Any]]:
     if isinstance(data, list):
         return data
 
-    # si quedó el formato viejo dict/files, reconstruimos desde processed
     if isinstance(data, dict):
         return rebuild_index_from_processed(repo_id)
 
@@ -755,7 +819,6 @@ def upload_pdf_and_json(
     pdf_path = f"raw/{doc_id}.pdf"
     json_path = f"processed/{doc_id}.json"
 
-    # 1) subir PDF
     hf.upload_file(
         path_or_fileobj=io.BytesIO(pdf_bytes),
         path_in_repo=pdf_path,
@@ -764,12 +827,10 @@ def upload_pdf_and_json(
         commit_message=f"Add PDF {doc_id}",
     )
 
-    # 2) enriquecer JSON
     processed_json = dict(processed_json or {})
     processed_json["source_url"] = source_url
     processed_json["sha256"] = sha256_digest
 
-    # 3) subir JSON
     json_bytes = json.dumps(processed_json, ensure_ascii=False, indent=2).encode("utf-8")
     hf.upload_file(
         path_or_fileobj=io.BytesIO(json_bytes),
@@ -779,7 +840,6 @@ def upload_pdf_and_json(
         commit_message=f"Add processed {doc_id}",
     )
 
-    # 4) actualizar índice correcto
     index = load_index(repo_id)
 
     record = {
@@ -957,7 +1017,6 @@ def main():
             log(f"📁 Nombre inferido: {fname}")
             log(f"🆔 doc_id: {doc_id}")
 
-            # Si por algún motivo ya existe ese doc_id, lo salteamos
             if doc_id in known_doc_ids:
                 log(f"⚠️ Saltado: doc_id ya existente {doc_id}")
                 skipped_count += 1
