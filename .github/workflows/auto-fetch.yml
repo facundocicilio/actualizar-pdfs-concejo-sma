@@ -15,6 +15,20 @@ jobs:
       - name: Install deps
         run: |
           pip install requests beautifulsoup4 python-dateutil huggingface_hub PyMuPDF lxml
+      - name: Rebuild index
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_REPO_ID: ${{ secrets.HF_REPO_ID }}
+        run: |
+          python - <<'EOF'
+          import os, sys
+          sys.path.insert(0, ".")
+          from auto_fetch import rebuild_index_from_processed, save_index
+          repo = os.environ["HF_REPO_ID"]
+          index = rebuild_index_from_processed(repo)
+          save_index(repo, index, message="Rebuild index from processed")
+          print(f"✅ Index reconstruido: {len(index)} documentos")
+          EOF
       - name: Run auto_fetch
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
