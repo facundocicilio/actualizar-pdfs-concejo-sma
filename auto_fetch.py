@@ -815,7 +815,7 @@ def is_probable_document_link(text: str, href: str) -> bool:
         return True
 
     href_keywords = ["upload", "uploads", "download", "descarga", "archivo", "file", "media", "wp-content", "document", "docs"]
-    text_keywords = ["orden", "día", "dia", "sesión", "sesion", "acta", "extraordinaria", "ordinaria", "documento", "descargar", "pdf"]
+    text_keywords = ["orden", "día", "dia", "sesión", "sesion", "acta", "extraordinaria", "ordinaria", "documento", "descargar", "descarga", "pdf"]
 
     if any(k in href_l for k in href_keywords) and any(k in text_l for k in text_keywords):
         return True
