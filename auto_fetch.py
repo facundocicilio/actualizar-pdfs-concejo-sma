@@ -28,7 +28,7 @@ UA = os.getenv(
     "Mozilla/5.0 (compatible; ObservatorioActasBot/2.0; +https://github.com/FacundoCicilio/Actualizar-PDFs-Concejo-SMA)"
 )
 
-PROCESSOR_VERSION = 25
+PROCESSOR_VERSION = 26
 
 session = requests.Session()
 session.headers.update({"User-Agent": UA})
@@ -314,18 +314,70 @@ def infer_impact(text):
     text_out = " ".join([f"{h}: {msg_map.get(h, '')}".strip() for h in top]).strip()
     return {"impact_tags": hits[:4], "impact_text": text_out}
 
+BASURA_PATTERNS = [
+    re.compile(r"^\d{5,6}[-/]\d{1,6}/\d{4}\s+\d{2}/\d{2}/\d{4}\s+Miembro\s+Informante:", re.IGNORECASE),
+    re.compile(r"^EE-\d{4}-\d+\S*\s+\d{2}/\d{2}/\d{4}\s+Miembro\s+Informante:", re.IGNORECASE),
+    re.compile(r"^Miembro\s+Informante:", re.IGNORECASE),
+]
+
+def is_basura(s):
+    s = (s or "").strip()
+    for p in BASURA_PATTERNS:
+        if p.search(s):
+            return True
+    return False
+
+def clean_que_dice(s):
+    """Limpia redundancias del texto antes de mostrarlo."""
+    s = normalize_space(s)
+    # Quitar "Dictamen s/" redundante
+    s = re.sub(r"^Dictamen\s+s/\s*", "", s, flags=re.IGNORECASE).strip()
+    # Quitar "Tema: Dictamen s/" 
+    s = re.sub(r"^Tema:\s*Dictamen\s+s/\s*", "", s, flags=re.IGNORECASE).strip()
+    # Quitar "Tema:" al inicio
+    s = re.sub(r"^Tema:\s*", "", s, flags=re.IGNORECASE).strip()
+    # Quitar número de decreto/expediente al inicio si es lo primero
+    s = re.sub(r"^\d+/\d{4}\s*[-—–]\s*", "", s).strip()
+    # Quitar ".- De Hacienda", ".- De Gobierno" al final
+    s = re.sub(r"\s*\.-\s*De\s+\w+\s*$", "", s, flags=re.IGNORECASE).strip()
+    s = re.sub(r"\s*\.-\s*$", "", s).strip()
+    return s
+
 def build_que_dice(raw):
     s = normalize_space(raw)
     if not s: return ""
-    action = "Tema"
+    if is_basura(s): return ""
+
+    # Limpiar texto
+    s = clean_que_dice(s)
+    if not s: return ""
+
+    action = ""
     t = s.lower()
-    if "dictamen" in t: action = "Dictamen"
-    elif "decreto" in t: action = "Decreto"
-    elif "nota" in t: action = "Nota"
-    elif "habilitación" in t or "habilitacion" in t: action = "Habilitación"
-    elif "obra" in t or "licitación" in t or "licitacion" in t: action = "Obra pública"
+    if "declaración de interés" in t or "declaracion de interes" in t:
+        action = "Declaración de Interés"
+    elif "dictamen" in t:
+        action = "Dictamen"
+        s = re.sub(r"^Dictamen\s+s/\s*", "", s, flags=re.IGNORECASE).strip()
+    elif "decreto" in t:
+        action = "Decreto"
+    elif "nota" in t:
+        action = "Nota"
+    elif "habilitación" in t or "habilitacion" in t or "licencia comercial" in t:
+        action = "Habilitación"
+    elif "convenio" in t:
+        action = "Convenio"
+    elif "obra" in t or "licitación" in t or "licitacion" in t:
+        action = "Obra pública"
+    elif "regularización" in t or "regularizacion" in t:
+        action = "Regularización"
+    elif "autorización" in t or "autorizacion" in t:
+        action = "Autorización"
+
     main = s if len(s) <= 260 else s[:260].rsplit(" ", 1)[0] + "…"
-    return f"{action}: {main}".strip()
+    if action:
+        return f"{action}: {main}".strip()
+    return main.strip()
 
 # Patrón SMA: "1. 05001-82/2024   02/03/2026   Miembro Informante: Concejal Vita"
 # siguiente línea: "181/2026 --- Tema: Dictamen s/ ..."
@@ -390,6 +442,12 @@ def extract_items(text):
         typ, m = hit
         key = (m.group(1) or "").strip()
         first = (m.group(2) or "").strip()
+
+        # Si el primer texto es basura (encabezado con Miembro Informante), saltear
+        if is_basura(first):
+            i += 1
+            continue
+
         parts = [first] if first else []
         j = i + 1
         while j < len(lines):
@@ -401,6 +459,11 @@ def extract_items(text):
         full = normalize_space(" ".join(parts))
         full = remove_boilerplate_global(full)
         if not full:
+            i = j
+            continue
+
+        # Filtrar si el texto completo es basura
+        if is_basura(full):
             i = j
             continue
 
