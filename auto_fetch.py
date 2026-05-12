@@ -9,81 +9,81 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
-
+ 
 import requests
 import fitz  # PyMuPDF
 from bs4 import BeautifulSoup
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.utils import HfHubHTTPError
-
+ 
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 HF_REPO_ID = os.getenv("HF_REPO_ID", "").strip()
 SOURCE_URL = os.getenv("SOURCE_URL", "").strip()
-
+ 
 INDEX_PATH = "index/index.json"
 DEBUG = os.getenv("DEBUG", "1").strip().lower() in {"1", "true", "yes", "y"}
-
+ 
 UA = os.getenv(
     "HTTP_USER_AGENT",
     "Mozilla/5.0 (compatible; ObservatorioActasBot/2.0; +https://github.com/FacundoCicilio/Actualizar-PDFs-Concejo-SMA)"
 )
-
+ 
 PROCESSOR_VERSION = 26
-
+ 
 session = requests.Session()
 session.headers.update({"User-Agent": UA})
-
+ 
 def log(msg): print(msg, flush=True)
 def dbg(msg):
     if DEBUG: print(msg, flush=True)
-
+ 
 def must_env(name):
     val = os.getenv(name, "").strip()
     if not val:
         raise SystemExit(f"Falta variable de entorno {name}.")
     return val
-
+ 
 def utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
-
+ 
 def normalize_space(s):
     s = (s or "").replace("\u00a0", " ")
     s = re.sub(r"[ \t]+", " ", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
-
+ 
 def _strip_accents(s):
     return "".join(c for c in unicodedata.normalize("NFD", s or "") if unicodedata.category(c) != "Mn")
-
+ 
 def normalize_text(s):
     if not s: return ""
     s = str(s).lower()
     s = _strip_accents(s)
     s = re.sub(r"\s+", " ", s)
     return s.strip()
-
+ 
 def safe_int(v):
     try:
         if v is None: return None
         return int(str(v).strip())
     except: return None
-
+ 
 def canonicalize_url(url):
     parsed = urlparse((url or "").strip())
     parsed = parsed._replace(fragment="")
     return urlunparse(parsed)
-
+ 
 def sha256_bytes(data):
     h = hashlib.sha256()
     h.update(data)
     return h.hexdigest()
-
+ 
 def make_doc_id(pdf_bytes, filename):
     h = hashlib.sha256()
     h.update(pdf_bytes)
     h.update((filename or "").encode("utf-8", errors="ignore"))
     return h.hexdigest()[:16]
-
+ 
 def safe_filename_from_url(url, content_disposition=None):
     if content_disposition:
         m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', content_disposition, re.I)
@@ -98,7 +98,7 @@ def safe_filename_from_url(url, content_disposition=None):
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
     if not name.lower().endswith(".pdf"): name += ".pdf"
     return name
-
+ 
 BOILERPLATE_PATTERNS = [
     r"Donar\s+Órganos\s+y\s+Sangre\s+es\s+Donar\s+Vida",
     r"Donar\s+Organos\s+y\s+Sangre\s+es\s+Donar\s+Vida",
@@ -110,7 +110,7 @@ BOILERPLATE_PATTERNS = [
     r"P[áa]gina\s+\d+\s+de\s+\d+",
     r"\bP[áa]g\.\s*\d+\b",
 ]
-
+ 
 def remove_boilerplate_lines(text):
     lines = (text or "").splitlines()
     cleaned = []
@@ -124,7 +124,7 @@ def remove_boilerplate_lines(text):
         ln_strip = re.sub(r"^[\-\•\●\·\*]+\s*", "", ln_strip).strip()
         cleaned.append(ln_strip)
     return "\n".join(cleaned)
-
+ 
 def remove_boilerplate_global(text):
     t = text or ""
     for p in BOILERPLATE_PATTERNS:
@@ -132,7 +132,7 @@ def remove_boilerplate_global(text):
     t = re.sub(r"[ \t]{2,}", " ", t)
     t = re.sub(r"\n\s+\n", "\n\n", t)
     return t.strip()
-
+ 
 def extract_text_from_pdf_bytes(pdf_bytes, max_pages=80):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     out = []
@@ -153,7 +153,7 @@ def extract_text_from_pdf_bytes(pdf_bytes, max_pages=80):
         out.append("")
     doc.close()
     return "\n".join(out)
-
+ 
 def extract_cover_lines(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     if len(doc) == 0: return []
@@ -172,13 +172,13 @@ def extract_cover_lines(pdf_bytes):
         txt = " ".join([w[4] for w in line_words]).strip()
         if txt: lines.append(txt)
     return lines
-
+ 
 MONTHS = {
     "enero": 1, "febrero": 2, "marzo": 3, "abril": 4, "mayo": 5, "junio": 6,
     "julio": 7, "agosto": 8, "septiembre": 9, "setiembre": 9, "octubre": 10,
     "noviembre": 11, "diciembre": 12,
 }
-
+ 
 def parse_spanish_date_any(s):
     s = (s or "").strip()
     m = re.search(r"\b(\d{1,2})\s+de\s+([A-Za-zÁÉÍÓÚáéíóúñÑ]+)\s+de\s+(20\d{2})\b", s, re.IGNORECASE)
@@ -188,7 +188,7 @@ def parse_spanish_date_any(s):
     if not mo: return None
     try: return datetime(y, mo, d)
     except: return None
-
+ 
 def parse_date_any(s):
     if not s: return datetime.min
     s = str(s).strip()
@@ -201,7 +201,7 @@ def parse_date_any(s):
     dt = parse_spanish_date_any(s)
     if dt: return dt
     return datetime.min
-
+ 
 def infer_num_year_from_filename(filename):
     if not filename: return (None, None)
     f = filename.lower()
@@ -214,12 +214,12 @@ def infer_num_year_from_filename(filename):
     m = re.search(r"\b(\d{1,3})[-_](\d{2})\b", f)
     if m: return (int(m.group(1)), 2000 + int(m.group(2)))
     return (None, None)
-
+ 
 def normalize_session_number(s):
     if not s: return None
     m = re.search(r"\b(\d{1,3})\b", str(s))
     return int(m.group(1)) if m else None
-
+ 
 def extract_box_header_info(pdf_bytes):
     lines = extract_cover_lines(pdf_bytes)
     if not lines: return {}
@@ -242,7 +242,7 @@ def extract_box_header_info(pdf_bytes):
     if sy: out["session_year"] = sy
     if date_str: out["date"] = date_str
     return out
-
+ 
 def parse_metadata(text, filename, box):
     t = text or ""
     head = "\n".join(t.splitlines()[:200])
@@ -270,7 +270,7 @@ def parse_metadata(text, filename, box):
     sn_int = normalize_session_number(session_number)
     session_number = str(sn_int) if sn_int is not None else None
     return {"session_type": session_type, "session_number": session_number, "session_year": session_year, "date": date_str}
-
+ 
 TOPIC_RULES = [
     ("Agua/Servicios", ["agua", "cloaca", "gas", "energía", "energia", "luz", "residuos", "basura", "saneamiento"]),
     ("Tarifas", ["tarifa", "tasas", "impuesto", "tribut", "arancel", "reajuste", "actualización", "actualizacion"]),
@@ -281,11 +281,11 @@ TOPIC_RULES = [
     ("Vivienda/Urbanismo", ["vivienda", "urban", "lote", "zonificación", "zonificacion", "catastro", "edificación", "edificacion", "loteo"]),
     ("Educación/Cultura", ["educación", "educacion", "escuela", "cultura", "biblioteca", "museo", "deporte"]),
 ]
-
+ 
 def classify_topics(text):
     t = (text or "").lower()
     return [label for label, keys in TOPIC_RULES if any(k in t for k in keys)]
-
+ 
 IMPACT_RULES = [
     ("💰 Bolsillo", ["tarifa", "tasa", "impuesto", "tribut", "arancel", "reajuste", "actualización", "actualizacion", "módulo", "modulo", "valor"]),
     ("🏗 Infraestructura", ["obra", "licitación", "licitacion", "contratación", "contratacion", "pavimento", "asfalto", "vereda", "plaza", "puente"]),
@@ -295,7 +295,7 @@ IMPACT_RULES = [
     ("🏘 Urbanismo", ["lote", "loteo", "urban", "zonificación", "zonificacion", "catastro", "edificación", "edificacion", "vivienda"]),
     ("🌿 Ambiente", ["ambiente", "bosque", "incendio", "impacto", "contaminación", "contaminacion", "reserva"]),
 ]
-
+ 
 def infer_impact(text):
     t = (text or "").lower()
     hits = [label for label, keys in IMPACT_RULES if any(k in t for k in keys)]
@@ -313,45 +313,36 @@ def infer_impact(text):
     top = hits[:2]
     text_out = " ".join([f"{h}: {msg_map.get(h, '')}".strip() for h in top]).strip()
     return {"impact_tags": hits[:4], "impact_text": text_out}
-
+ 
 BASURA_PATTERNS = [
     re.compile(r"^\d{5,6}[-/]\d{1,6}/\d{4}\s+\d{2}/\d{2}/\d{4}\s+Miembro\s+Informante:", re.IGNORECASE),
     re.compile(r"^EE-\d{4}-\d+\S*\s+\d{2}/\d{2}/\d{4}\s+Miembro\s+Informante:", re.IGNORECASE),
     re.compile(r"^Miembro\s+Informante:", re.IGNORECASE),
 ]
-
+ 
 def is_basura(s):
     s = (s or "").strip()
     for p in BASURA_PATTERNS:
         if p.search(s):
             return True
     return False
-
+ 
 def clean_que_dice(s):
-    """Limpia redundancias del texto antes de mostrarlo."""
     s = normalize_space(s)
-    # Quitar "Dictamen s/" redundante
     s = re.sub(r"^Dictamen\s+s/\s*", "", s, flags=re.IGNORECASE).strip()
-    # Quitar "Tema: Dictamen s/" 
     s = re.sub(r"^Tema:\s*Dictamen\s+s/\s*", "", s, flags=re.IGNORECASE).strip()
-    # Quitar "Tema:" al inicio
     s = re.sub(r"^Tema:\s*", "", s, flags=re.IGNORECASE).strip()
-    # Quitar número de decreto/expediente al inicio si es lo primero
     s = re.sub(r"^\d+/\d{4}\s*[-—–]\s*", "", s).strip()
-    # Quitar ".- De Hacienda", ".- De Gobierno" al final
     s = re.sub(r"\s*\.-\s*De\s+\w+\s*$", "", s, flags=re.IGNORECASE).strip()
     s = re.sub(r"\s*\.-\s*$", "", s).strip()
     return s
-
+ 
 def build_que_dice(raw):
     s = normalize_space(raw)
     if not s: return ""
     if is_basura(s): return ""
-
-    # Limpiar texto
     s = clean_que_dice(s)
     if not s: return ""
-
     action = ""
     t = s.lower()
     if "declaración de interés" in t or "declaracion de interes" in t:
@@ -373,35 +364,31 @@ def build_que_dice(raw):
         action = "Regularización"
     elif "autorización" in t or "autorizacion" in t:
         action = "Autorización"
-
     main = s if len(s) <= 260 else s[:260].rsplit(" ", 1)[0] + "…"
     if action:
         return f"{action}: {main}".strip()
     return main.strip()
-
-# Patrón SMA: "1. 05001-82/2024   02/03/2026   Miembro Informante: Concejal Vita"
-# siguiente línea: "181/2026 --- Tema: Dictamen s/ ..."
+ 
 MI_PAT = re.compile(
     r"^(\d{1,2})\.\s+((?:\d{5,6}[-/]\d{1,6}/\d{4}|EE-\d{4}-\d+\S*))\s+\d{2}/\d{2}/\d{4}\s+Miembro\s+Informante:",
     re.IGNORECASE
 )
 TEMA_LINE_PAT = re.compile(r"^\d+/\d{4}\s*---\s*Tema:\s*(.+)$", re.IGNORECASE)
-
+ 
 def extract_items(text):
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     items = []
-
     exp_tema_pat = re.compile(r"^(\d{1,6}(?:[-]\d{1,6})?/\d{4})\s*[—–-]\s*Tema:\s*(.*)$", re.IGNORECASE)
     exp_pat = re.compile(r"^(\d{1,6}(?:[-]\d{1,6})?/\d{4})\s*[—–-]\s*(.*)$", re.IGNORECASE)
     num_pat = re.compile(r"^(\d{1,2})[\.\)]\s+(.*)$")
-
+ 
     def is_new_item(line):
         if MI_PAT.match(line): return None
         for typ, p in [("exp_tema", exp_tema_pat), ("exp", exp_pat), ("num", num_pat)]:
             m = p.match(line)
             if m: return (typ, m)
         return None
-
+ 
     i = 0
     while i < len(lines):
         mi_match = MI_PAT.match(lines[i])
@@ -433,21 +420,17 @@ def extract_items(text):
                                   "decreto": None, "expediente": exp_ref, "topics": classify_topics(full)})
             i = j
             continue
-
+ 
         hit = is_new_item(lines[i])
         if not hit:
             i += 1
             continue
-
         typ, m = hit
         key = (m.group(1) or "").strip()
         first = (m.group(2) or "").strip()
-
-        # Si el primer texto es basura (encabezado con Miembro Informante), saltear
         if is_basura(first):
             i += 1
             continue
-
         parts = [first] if first else []
         j = i + 1
         while j < len(lines):
@@ -455,18 +438,14 @@ def extract_items(text):
             if is_new_item(lines[j]): break
             parts.append(lines[j])
             j += 1
-
         full = normalize_space(" ".join(parts))
         full = remove_boilerplate_global(full)
         if not full:
             i = j
             continue
-
-        # Filtrar si el texto completo es basura
         if is_basura(full):
             i = j
             continue
-
         dec_inside = None
         mdec = re.search(r"(?:Decreto)\s*(?:N[°º]\s*)?([A-Z0-9\-\./]+)", full, re.IGNORECASE)
         if mdec: dec_inside = mdec.group(1)
@@ -480,11 +459,11 @@ def extract_items(text):
                        "decreto": dec_inside, "expediente": exp_inside or (key if typ in ("exp", "exp_tema") else None),
                        "topics": classify_topics(full)})
         i = j
-
+ 
     for idx, it in enumerate(items, start=1):
         if not it.get("key"): it["key"] = str(idx)
     return items[:800]
-
+ 
 def build_summary_citizen(meta, topics, items):
     parts = []
     head = []
@@ -507,7 +486,7 @@ def build_summary_citizen(meta, topics, items):
     else:
         parts.append("No se detectaron ítems claros (PDF escaneado o texto muy roto).")
     return "\n".join(parts)
-
+ 
 def process_pdf(pdf_bytes, filename):
     box = extract_box_header_info(pdf_bytes)
     raw_text = extract_text_from_pdf_bytes(pdf_bytes)
@@ -525,24 +504,63 @@ def process_pdf(pdf_bytes, filename):
         "summary_citizen": build_summary_citizen(meta, topics, items),
         "text_preview": text[:12000],
     }
-
+ 
 def api():
     if not HF_TOKEN: raise RuntimeError("Falta HF_TOKEN.")
     return HfApi(token=HF_TOKEN)
-
+ 
 def download_text_file(repo_id, path):
     try:
         local = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename=path, token=HF_TOKEN)
         with open(local, "r", encoding="utf-8") as f: return f.read()
     except HfHubHTTPError: return None
     except: return None
-
+ 
 def load_processed_json(repo_id, doc_id):
     raw = download_text_file(repo_id, f"processed/{doc_id}.json")
     if not raw: return None
     try: return json.loads(raw)
     except: return None
-
+ 
+# ============================================================
+# UPLOAD ROBUSTO CON RETRY Y VERIFICACION
+# ============================================================
+ 
+def _upload_with_retry(hf, path_or_fileobj, path_in_repo, repo_id, repo_type, commit_message, max_retries=3):
+    """Sube un archivo con reintentos. Devuelve True si funcionó."""
+    for attempt in range(max_retries):
+        try:
+            if hasattr(path_or_fileobj, 'seek'):
+                path_or_fileobj.seek(0)
+            hf.upload_file(
+                path_or_fileobj=path_or_fileobj,
+                path_in_repo=path_in_repo,
+                repo_id=repo_id,
+                repo_type=repo_type,
+                commit_message=commit_message,
+            )
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                log(f"⚠️ Intento {attempt+1} falló al subir {path_in_repo}: {e}. Reintentando en {wait}s…")
+                time.sleep(wait)
+            else:
+                log(f"❌ Falló al subir {path_in_repo} tras {max_retries} intentos: {e}")
+    return False
+ 
+ 
+def _file_exists_in_dataset(repo_id, path):
+    """Verifica que un archivo realmente existe en el dataset."""
+    try:
+        hf = api()
+        files = hf.list_repo_files(repo_id=repo_id, repo_type="dataset")
+        return path in files
+    except Exception as e:
+        log(f"⚠️ No pude verificar existencia de {path}: {e}")
+        return False
+ 
+ 
 def rebuild_index_from_processed(repo_id):
     log("🛠 Reconstruyendo index desde processed/*.json ...")
     out = []
@@ -568,7 +586,7 @@ def rebuild_index_from_processed(repo_id):
     out.sort(key=lambda r: (safe_int(r.get("session_year")) or 0, normalize_session_number(r.get("session_number")) or 0, r.get("created_at") or ""), reverse=True)
     log(f"✅ Index reconstruido con {len(out)} documentos.")
     return out
-
+ 
 def load_index(repo_id):
     raw = download_text_file(repo_id, INDEX_PATH)
     if not raw: return []
@@ -577,24 +595,64 @@ def load_index(repo_id):
     if isinstance(data, list): return data
     if isinstance(data, dict): return rebuild_index_from_processed(repo_id)
     return []
-
+ 
 def save_index(repo_id, index, message="Update index"):
     content = json.dumps(index, ensure_ascii=False, indent=2).encode("utf-8")
-    api().upload_file(path_or_fileobj=io.BytesIO(content), path_in_repo=INDEX_PATH,
-                      repo_id=repo_id, repo_type="dataset", commit_message=message)
-
+    hf = api()
+    return _upload_with_retry(
+        hf=hf,
+        path_or_fileobj=io.BytesIO(content),
+        path_in_repo=INDEX_PATH,
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=message,
+    )
+ 
 def upload_pdf_and_json(repo_id, doc_id, pdf_bytes, processed_json, original_filename, source_url, sha256_digest):
+    """
+    Sube PDF + JSON + actualiza índice con verificación.
+    Si el PDF falla, NO actualiza el índice (evita registros huérfanos).
+    """
     hf = api()
     pdf_path = f"raw/{doc_id}.pdf"
     json_path = f"processed/{doc_id}.json"
-    hf.upload_file(path_or_fileobj=io.BytesIO(pdf_bytes), path_in_repo=pdf_path,
-                   repo_id=repo_id, repo_type="dataset", commit_message=f"Add PDF {doc_id}")
+ 
+    # 1) Subir PDF con retry
+    pdf_ok = _upload_with_retry(
+        hf=hf,
+        path_or_fileobj=io.BytesIO(pdf_bytes),
+        path_in_repo=pdf_path,
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=f"Add PDF {doc_id}",
+    )
+    if not pdf_ok:
+        raise RuntimeError(f"No se pudo subir el PDF {pdf_path} tras varios intentos.")
+ 
+    # 2) Verificar que el PDF realmente está en el dataset
+    if not _file_exists_in_dataset(repo_id, pdf_path):
+        raise RuntimeError(f"El PDF {pdf_path} no aparece en el dataset tras el upload. Abortando.")
+    log(f"✅ PDF verificado en dataset: {pdf_path}")
+ 
+    # 3) Subir JSON con retry
     processed_json = dict(processed_json or {})
     processed_json["source_url"] = source_url
     processed_json["sha256"] = sha256_digest
     json_bytes = json.dumps(processed_json, ensure_ascii=False, indent=2).encode("utf-8")
-    hf.upload_file(path_or_fileobj=io.BytesIO(json_bytes), path_in_repo=json_path,
-                   repo_id=repo_id, repo_type="dataset", commit_message=f"Add processed {doc_id}")
+ 
+    json_ok = _upload_with_retry(
+        hf=hf,
+        path_or_fileobj=io.BytesIO(json_bytes),
+        path_in_repo=json_path,
+        repo_id=repo_id,
+        repo_type="dataset",
+        commit_message=f"Add processed {doc_id}",
+    )
+    if not json_ok:
+        raise RuntimeError(f"PDF subido OK pero NO se pudo subir el JSON {json_path}. NO actualizo el índice.")
+    log(f"✅ JSON subido: {json_path}")
+ 
+    # 4) Actualizar índice (solo si todo lo anterior funcionó)
     index = load_index(repo_id)
     record = {
         "doc_id": doc_id, "original_filename": original_filename,
@@ -606,9 +664,14 @@ def upload_pdf_and_json(repo_id, doc_id, pdf_bytes, processed_json, original_fil
     }
     index = [r for r in index if r.get("doc_id") != doc_id]
     index.insert(0, record)
-    save_index(repo_id, index, message=f"Index {doc_id}")
+    index_ok = save_index(repo_id, index, message=f"Index {doc_id}")
+    if not index_ok:
+        log(f"⚠️ PDF y JSON subidos OK pero falló el update del índice para {doc_id}. Va a quedar inconsistente.")
+    else:
+        log(f"✅ Índice actualizado con {doc_id}")
+ 
     return {"pdf_path": pdf_path, "json_path": json_path}
-
+ 
 def is_probable_document_link(text, href):
     href_l = (href or "").lower()
     text_l = (text or "").lower()
@@ -617,7 +680,7 @@ def is_probable_document_link(text, href):
     text_keywords = ["orden", "día", "dia", "sesión", "sesion", "acta", "extraordinaria", "ordinaria", "documento", "descargar", "descarga", "pdf"]
     if any(k in href_l for k in href_keywords) and any(k in text_l for k in text_keywords): return True
     return False
-
+ 
 def fetch_pdf_links(page_url):
     log(f"🌐 Leyendo página: {page_url}")
     r = session.get(page_url, timeout=30)
@@ -646,7 +709,7 @@ def fetch_pdf_links(page_url):
     log(f"📄 Documentos candidatos únicos encontrados: {len(out)}")
     for u in out: log(f"   - {u}")
     return out
-
+ 
 def download_pdf(url):
     r = session.get(url, timeout=60, allow_redirects=True)
     r.raise_for_status()
@@ -658,59 +721,95 @@ def download_pdf(url):
     if not looks_like_pdf:
         raise ValueError(f"No parece PDF. URL final: {final_url} | Content-Type: {content_type}")
     return r.content, final_url, content_disposition
-
+ 
+ 
+def auto_heal_index(repo_id):
+    """
+    Verifica que cada registro del índice tenga su PDF y JSON.
+    Si falta el PDF de algun registro, lo logea para revisión manual.
+    Se ejecuta al inicio de cada run.
+    """
+    log("🔍 Verificando integridad del índice...")
+    index = load_index(repo_id)
+    try:
+        hf = api()
+        files = set(hf.list_repo_files(repo_id=repo_id, repo_type="dataset"))
+    except Exception as e:
+        log(f"⚠️ No pude listar files del dataset: {e}")
+        return
+ 
+    huérfanos = []
+    for record in index:
+        doc_id = record.get("doc_id")
+        if not doc_id: continue
+        pdf_path = record.get("pdf_path") or f"raw/{doc_id}.pdf"
+        if pdf_path not in files:
+            huérfanos.append(doc_id)
+            log(f"⚠️ Registro huérfano detectado: {doc_id} (PDF {pdf_path} no existe)")
+ 
+    if huérfanos:
+        log(f"⚠️ Hay {len(huérfanos)} registros huérfanos. Limpiando del índice…")
+        index_clean = [r for r in index if r.get("doc_id") not in huérfanos]
+        ok = save_index(repo_id, index_clean, message=f"Auto-heal: remove {len(huérfanos)} orphan records")
+        if ok:
+            log(f"✅ Índice limpio. Los PDFs huérfanos se van a re-descargar en el próximo ciclo.")
+    else:
+        log("✅ Índice íntegro.")
+ 
+ 
 def main():
     must_env("HF_TOKEN")
     must_env("HF_REPO_ID")
-
+ 
     parser = argparse.ArgumentParser()
     parser.add_argument("--year", type=int, default=None)
     parser.add_argument("--source-url", type=str, default=None)
     parser.add_argument("--sleep", type=float, default=0.0)
     args = parser.parse_args()
-
+ 
     year = args.year or datetime.now().year
     page_url = (args.source_url or SOURCE_URL or f"https://prensacd.cdsma.gob.ar/ordenes-del-dia-{year}/").strip()
-
+ 
     log("🚀 Auto fetch iniciado")
     log(f"📦 Repo: {HF_REPO_ID}")
     log(f"📰 Fuente: {page_url}")
     log(f"🗓️ Año: {year}")
     log(f"🐞 DEBUG: {DEBUG}")
-
+ 
+    # AUTO-HEAL: limpiar registros huérfanos antes de empezar
+    auto_heal_index(HF_REPO_ID)
+ 
     index = load_index(HF_REPO_ID)
     known_source_urls = {canonicalize_url((r.get("source_url") or "").strip()) for r in index if (r.get("source_url") or "").strip()}
     known_doc_ids = {r.get("doc_id") for r in index if r.get("doc_id")}
-
+ 
     log(f"📚 Documentos ya indexados: {len(index)}")
     for r in index[:20]:
         dbg(f"   - {r.get('doc_id')} | {r.get('original_filename')} | {r.get('source_url')}")
-
+ 
     pdf_links = fetch_pdf_links(page_url)
     new_links = [u for u in pdf_links if canonicalize_url(u) not in known_source_urls]
     log(f"🆕 Nuevos detectados por URL: {len(new_links)}")
     for u in new_links: log(f"   - {u}")
-
+ 
     uploaded_count = 0
     reprocessed_count = 0
     skipped_count = 0
     errors = []
-
-    # Procesar todos los links: nuevos se suben, existentes se reprocesан si versión vieja
+ 
     for url in pdf_links:
         try:
             canon_url = canonicalize_url(url)
             is_new = canon_url not in known_source_urls
-
+ 
             log(f"⬇️ Descargando: {url}")
             data, final_url, content_disposition = download_pdf(url)
             digest = sha256_bytes(data)
             fname = safe_filename_from_url(final_url, content_disposition)
             doc_id = make_doc_id(data, fname)
-
+ 
             log(f"✅ Descargado OK. Bytes: {len(data)} | doc_id: {doc_id}")
-
-            # Si ya existe, verificar si necesita reprocesado
+ 
             if not is_new and doc_id in known_doc_ids:
                 existing_json = load_processed_json(HF_REPO_ID, doc_id)
                 if existing_json and existing_json.get("processor_version", 0) < PROCESSOR_VERSION:
@@ -725,26 +824,26 @@ def main():
                     log(f"⚠️ Saltado: versión actual, doc_id {doc_id}")
                     skipped_count += 1
                 continue
-
+ 
             if not is_new:
                 log(f"⚠️ Saltado: source_url ya existente {final_url}")
                 skipped_count += 1
                 continue
-
+ 
             with_index_same_url = any(canonicalize_url((r.get("source_url") or "").strip()) == final_url for r in index)
             if with_index_same_url:
                 log(f"⚠️ Saltado: source_url ya existente {final_url}")
                 skipped_count += 1
                 continue
-
+ 
             log("🧠 Procesando PDF...")
             processed = process_pdf(data, fname)
-
+ 
             log("📦 Subiendo raw + processed + index...")
             upload_pdf_and_json(repo_id=HF_REPO_ID, doc_id=doc_id, pdf_bytes=data,
                                 processed_json=processed, original_filename=fname,
                                 source_url=final_url, sha256_digest=digest)
-
+ 
             index.insert(0, {
                 "doc_id": doc_id, "original_filename": fname,
                 "pdf_path": f"raw/{doc_id}.pdf", "json_path": f"processed/{doc_id}.json",
@@ -757,18 +856,19 @@ def main():
             known_source_urls.add(final_url)
             uploaded_count += 1
             log("✅ Documento subido y indexado correctamente.")
-
+ 
             if args.sleep > 0: time.sleep(args.sleep)
-
+ 
         except Exception as e:
             err = f"❌ Error con {url}: {e}"
             log(err)
             errors.append(err)
-
+ 
     log(f"🏁 Fin. Nuevos: {uploaded_count} | Reprocesados: {reprocessed_count} | Saltados: {skipped_count} | Errores: {len(errors)}")
     if errors:
         log("⚠️ Errores:")
         for e in errors: log(f"   - {e}")
-
+ 
 if __name__ == "__main__":
     main()
+ 
